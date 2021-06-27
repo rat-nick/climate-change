@@ -1,0 +1,766 @@
+---
+header-includes:
+   - \usepackage[serbian]{babel}
+   - \usepackage{blindtext}
+output: pdf_document
+---
+
+```{=latex}
+\begin{titlepage}
+
+\begin{center}
+
+% Gornji deo stranice
+\includegraphics[width=0.25\textwidth]{logo-pmf.pdf}\\[1cm]    
+
+\textsc{\LARGE Institut za matematiku i informatiku
+\\ Prirodno-matematički fakultet \vspace{0.3cm}
+\\ Univerzitet u Kragujevcu}\\[1.5cm]
+
+\textsc{\Large Seminarski rad iz predmeta \\ Predstavljanje i tumačenje podataka}\\[1.0 cm]
+
+% Naslov
+{ \huge \bfseries Eksploratorna analiza}\\[1.0cm]
+{ \LARGE Globalne temperature od 1775. godine}\\[3.4cm]
+
+
+% Autor i mentor
+\begin{minipage}{0.4\textwidth}
+\begin{flushleft} \large
+\emph{Student:}\\
+Nikola Ratinac 1030/2019
+\end{flushleft}
+\end{minipage}
+\begin{minipage}{0.4\textwidth}
+\begin{flushright} \large
+\emph{Profesor:} \\
+dr Marinko Timotijević
+\end{flushright}
+\end{minipage}
+
+\vfill
+
+% Dno stranice
+{\large Februar 2021.}
+
+\end{center}
+
+\end{titlepage}
+
+\tableofcontents
+\newpage
+```
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(Amelia)
+library(ggplot2)
+library(countrycode)
+library(rworldmap)
+library(broom)
+library(gridExtra)
+library(data.table)
+library(naniar)
+library(imputeTS)
+library(janitor)
+library(xts)
+library(lubridate)
+library(viridis)
+library(ggfortify)
+library(ggpubr)
+library(ggmap)
+library(rworldmap)
+library(rnaturalearth)
+library(rnaturalearthdata)
+library(sf)
+library(sp)
+library(rgeos)
+library(mapdata)
+library(gstat)
+library(gridExtra)
+options(tinytex.verbose = TRUE)
+knitr::opts_chunk$set(echo = TRUE)
+
+```
+
+Predmet rada jeste utvrđivanje prosečnih mesečnih temperatura po godini i zemlji i utrvrđivanje globalnog trenda prosečne godišnje temperature. 
+
+# Baza podataka
+
+Baza podataka se sastoji od 6 .csv fajlova.
+```{r list input}
+system("ls input", intern=TRUE)
+```
+Učitaćemo podatke i ispitati njihovu strukturu.
+
+```{r reading input, messages=FALSE}
+df_city <- fread("input/GlobalLandTemperaturesByCity.csv")
+df_country <- read.csv("input/GlobalLandTemperaturesByCountry.csv", stringsAsFactors = F)
+df_emission <- read.csv("input/EmissionData.csv", check.names = FALSE, stringsAsFactors = F, header = T)
+df_global <- read.csv("input/GlobalTemperatures.csv", stringsAsFactors = F)
+```
+
+```{r}
+str(df_city)
+```
+Podaci koji se odnose na temperature po gradovima su podeljeni po sledećim kolonama:
+
+* dt - datum obzervacije izvedena na mesečnom nivou
+* AverageTemperature - prosečna temperatura tog meseca
+* AverageTemperatureUncertainty - nesigurnost u podatak o prosečnoj temperaturi
+* City - naziv grada
+* Country - naziv države
+* Latitude - geografska širina
+* Longitude - geografska dužina
+
+```{r, podaci o gradovima}
+summary(df_city)
+```
+Pogledajmo od čega se sastoji skup podataka vezan za temperature po državama.
+```{r, podaci o državama}
+str(df_country)
+```
+Podaci koji se odnose na temperature po državama su podeljenji po sledećim kolonama:
+
+* dt - datum obzervacije izvedena na mesečnom nivou
+* AverageTemperature - prosečna temperatura tog meseca
+* AverageTemperatureUncertainty - nesigurnost u podatak o prosečnoj temperaturi
+* Country - naziv države
+
+```{r df_country summary}
+summary(df_country)
+```
+Predstavimo i podatke o emitovanju CO2 u atmosferu.
+```{r df_emission preview}
+str(df_emission[1:15])
+```
+Ovaj skup podataka nije pogodan za dalju obradu ovakav kakav jeste, stoga ćemo 
+njime podrobnije pozabaviti prilikom pripreme podataka.
+
+```{r df_global preview}
+str(df_global)
+```
+
+```{r, summary u globalu}
+summary(df_global)
+```
+
+```{=latex}
+\newpage
+```
+# Priprema podataka
+
+Pre nego sto pocnemo sa analizom podataka, potrebno je podtatke precistiti od 
+nepostojecih vrednosti, ukloniti kolone koje nam ne govore nista i podatke 
+transformisati na nacin pogodan za obradu i vizuelizaciju.
+
+## Transformacija podataka
+
+U ovom odeljku se bavimo organizaciom podataka tako da oni imaju najvise smisla
+za onog koji ce se njima baviti. Posto u nekom trenutku treba implementirati
+modele masinskog ucenja koji su zasnovani na vremenskim serijama, potrebno je
+datume pretvoriti iz string reprezentacije u `Date` reprezentaciju koja je:
+
+* Razumljiva R-u
+* Pogodna za uspostavljanje hronoloskog poretka obzervacija
+
+```{r Date setup, messages=FALSE}
+df_country$dt <- as.Date(df_country$dt)
+df_city$dt <- as.Date(df_city$dt)
+df_global$dt <- as.Date(df_global$dt)
+```
+
+Korisno je i imati zasebne vrednosti za mesece i godine.
+```{r year and month feature generation}
+df_country$year <- format(as.Date(df_country$dt), "%Y")
+df_country$month <- format(as.Date(df_country$dt), "%m")
+df_global$year <- format(as.Date(df_global$dt), "%Y")
+df_global$month <- format(as.Date(df_global$dt), "%m")
+df_city$year <- format(as.Date(df_city$dt), "%Y")
+df_city$month <- format(as.Date(df_city$dt), "%m")
+```
+
+Pogodno podatke transformisati na nacin da budu u nekoj meri smisleni
+onome kome je zadatak da ih analizira. Stoga je korisno kolone nazivati smisleno
+i koncizno, a skupove podataka pretvoriti u one tipove koji su najpogodniji 
+za analizu.
+
+```{r change to tibble}
+df_country <- as_tibble(df_country)
+df_city <- as_tibble(df_city)
+df_global <- as_tibble(df_global)
+
+df_country <- df_country %>% rename(
+    avgT = AverageTemperature,
+    avgTU = AverageTemperatureUncertainty
+)
+
+df_city <- df_city %>% rename(
+    avgT = AverageTemperature,
+    avgTU = AverageTemperatureUncertainty,
+    Lat = Latitude,
+    Lng = Longitude
+)
+
+df_global <- df_global %>% rename(
+    avgT = LandAverageTemperature,
+    avgTU = LandAverageTemperatureUncertainty,
+    maxT = LandMaxTemperature,
+    maxTU = LandMaxTemperatureUncertainty,
+    minT = LandMinTemperature,
+    minTU = LandMinTemperatureUncertainty
+)
+
+df_global <- df_global %>% 
+    dplyr::select(-LandAndOceanAverageTemperature, -LandAndOceanAverageTemperatureUncertainty)
+```
+
+Skup podataka `df_emission` je problematičan jer se vremenska komponenta
+izražava u kolonama. To rešavamo tako što transponujemo podatke da bi 
+vremenska komponenta bila vertikalna. 
+
+```{r df_emission wrangling}
+library(janitor)
+library(corrplot)
+df_yearly_temps <- df_global %>% group_by(year) %>% 
+    summarise(temperature = mean(avgT))
+df_emission <- as.data.frame(t(as.matrix(df_emission)))
+df_emission <- df_emission %>% row_to_names(1)
+df_emission_world <- as.data.frame(as.numeric(as.character(df_emission$World)))
+colnames(df_emission_world) <- c("world emission")
+yearly_emission_and_temp <- cbind(df_yearly_temps, head(df_emission_world, -1))
+yearly_emission_and_temp$year <- as.numeric(yearly_emission_and_temp$year)
+yearly_emission_and_temp <- yearly_emission_and_temp %>% na.omit()
+xts_emission <- as.xts(ts(df_emission, start=1751, frequency = 1, deltat = 1))
+```
+
+```{r df_city chr lat lng to numeric}
+library(stringr)
+str2dec <- function(str){
+    last_char <- str[nchar(str)-1]
+    if(last_char %in% c('N','W'))
+    {
+        return (as.numeric(str_sub(str, end=nchar(str)-1)))
+    }
+    else
+    {
+        return (-1*as.numeric(str_sub(str, end=nchar(str)-1)))
+    }
+}
+df_city$Lng <- df_city$Lng  %>% str2dec()
+df_city$Lat <- df_city$Lat  %>% str2dec()
+head(df_city[c("Lat","Lng")])
+```
+## Pronalaženje i rešavanje nepostojećih vrednosti
+
+```{r global_data missing values}
+vis_miss(df_global[2:7])
+
+```
+
+Prilikom pregleda podataka mozemo utvrditi da u `df_global` skupu podataka postoji 
+znacajan broj tj. 25.2% nepostojećih vrednosti. 
+Kako su naše obzervacije hronološki poređane, to se može tumačiti
+time da se prosečna temperatura meri skoro od početka skupa podataka, dok se 
+minimalna i maksimalna počinju meriti neštko kasnije. Jedo od rešenja jeste 
+vertikalno razdvajanje prosečne i minimalne i maksimalne temperature, no s 
+obzirom da imamo valjan razlog da opravdamo nepostojeće vrednosti, to nećemo
+uraditi.
+
+## Selekcija atributa
+```{r df_country transformation}
+df_avgT_by_country <- df_country[-3] %>% spread(Country, avgT)
+```
+
+```{=latex}
+\newpage
+```
+# Analiza
+## Globalna
+
+### Trend
+
+```{r global temperature, warning=FALSE, error=FALSE}
+data_world <- df_global %>% 
+    group_by(year) %>% 
+    summarize(avgYearlyTemp=mean(avgT,na.rm=T)) 
+data_world$year <- as.numeric(data_world$year)
+
+ggplot(data_world, aes(x=year, y=avgYearlyTemp,color=avgYearlyTemp))+
+    geom_point()+
+    scale_color_viridis(option = "C")+
+    geom_smooth(method = "lm", color="black") +
+    geom_line(aes(
+        y=rollmean(
+            avgYearlyTemp, 20, 
+            na.pad = TRUE)), 
+        colour="yellow", 
+        size=1) + 
+    theme(axis.line = element_line(color = "orange",size=1)) +
+    scale_x_continuous(breaks = seq(1750, 2013, by = 20)) +
+    scale_y_continuous(breaks = seq(5 , 10, by=0.5)) +
+    theme(panel.background=element_blank())+
+    theme_dark() +
+    theme(legend.position = "bottom",axis.title = element_blank(),
+                     axis.text = element_text(size = 12,face="bold"),
+        plot.title = element_text(size=14,face = "bold")) + 
+  ggtitle(sprintf("Globalna prosecna temperatura raste"), subtitle = "od 1796. do 2013.") 
+```
+
+#### Analiza
+* Primetan je porast globalne temperature od oko 1 stepen celzijusa od 1750. 
+godine do danas (crna linija)
+* Temperature od 1750. do 1830. godine imaju veliku nesigurnost u merenju
+* Od 1975. godine do danas temperatura raste značajnije nego pre (žuta linija)
+
+### Uticaj emisije C02 na globalne temperature
+
+Potrebno je ispitati da li emisija ugljen-dioksida utiče na porast globalne temperature.
+Prvo, treba videti kako izgleda korelaciona matrica.
+```{r corrplot for emission and world temperature}
+corrplot(cor(yearly_emission_and_temp), method = "number")
+```
+
+
+Dalje, možemo da probamo da fitujemo linearan model gde će temperatura zavisiti od
+emisije ugljen dioksida.
+
+```{r}
+df <- yearly_emission_and_temp %>% filter(year >= 1900)
+model <- lm(temperature ~ `world emission`, data = df)
+summary(model)
+ggplot(data = df, aes(x=`year`, y=temperature)) +
+    geom_point(aes(color=`world emission`)) +
+    geom_smooth(method = "lm")
+```
+
+P vrednost modela je višestruko manja od 0.05 iz čega zaklučujemo da emisija ugljen dioksida
+utiče na globalnu temperaturu. S obzirom da je R-squared > 0.7, kažemo da postoji jaka pozitivna veza
+izmedju emisije CO2 i globalne temperature. 
+
+
+```{=latex}
+\newpage
+```
+### Najpogodjenije države
+
+```{r highhest average temp change, warning=FALSE}
+dc <- df_country %>%
+    filter(year=='1875'|year=='2012')%>%
+    group_by(Country,year)%>%
+    summarize(temp=mean(avgT))%>%
+    spread(year,temp)
+
+dc$change <- dc$`2012`- dc$`1875`
+dc <- dc%>%filter(!is.na(change))%>%arrange(desc(change))%>%head(n=20)
+
+dc$Country <- factor(dc$Country, levels = dc$Country)
+
+dc %>% 
+    ggplot() + geom_col(aes(x=reorder(Country,change), change)) +
+    ggtitle("Drzave sa najvecom promenom prosecne temperature") +
+    coord_flip() + ylab("Promena temperature") + xlab("Država") 
+
+```
+
+#### Analiza
+
+* Srbija se nalazi na 15. mestu po promeni prosečne temperature od 1796. godine
+* Ta promeni iznosi nešto manje od 3 stepena celzijusa
+* Najugroženije su ostrvske zemlje 
+
+### Minimalna, maksimalna i prosečna temperatura
+
+```{r ts global decomposition, warning=FALSE}
+data_globe <- df_global%>%
+    group_by(year)%>%
+    summarize(max=max(avgT,na.rm=T),min=min(avgT,na.rm=T),Avg_Temp=mean(avgT,na.rm=T)) %>% 
+    gather(level,Temp, 2:4)
+
+ggplot(data_globe, aes(x=year, y=Temp,colour=Temp,group=level))+
+    geom_line() +
+    scale_color_viridis(option="A") +
+    scale_x_discrete(breaks = seq(1750, 2013, by = 40))+
+    theme(panel.background=element_blank())+
+    theme_dark()+
+    theme(legend.position = "bottom",axis.title = element_blank(),
+            axis.text = element_text(size = 12,face="bold"),
+            plot.title = element_text(size=16,face = "bold")) + 
+    ggtitle("Minimalna, prosecna i maksimalna temperatura",subtitle = "od 1796. do 2013.") 
+```
+
+#### Analiza
+
+* Primećuje se porast prosečne, minimalne i maksimalne temperature po godinama
+* Primećuje se i da porast nakon 1950. godine ima veći nagib
+
+### Mesečne temperature kroz godine
+
+```{r months through the years global, warning=FALSE}
+glb_mty <- df_global %>% 
+    filter(!is.na(avgT)) %>% 
+    group_by(month) %>% 
+    filter(avgTU < .5)
+
+ggplot(glb_mty,aes(month,avgT,color=as.numeric(year))) + 
+    geom_jitter(size=1) +
+    scale_color_viridis(option="C")+
+    theme(axis.line = element_line(color = "orange",size=.75))+
+    theme_dark()+
+    scale_x_discrete()+labs(color="year") +
+    theme(
+        legend.position = "bottom",
+        axis.text = element_text(size = 8,face="bold"),
+        plot.title = element_text(size=17,face = "bold")) + 
+    ggtitle(expression("Mesecne globalne temperature po godini")) 
+```
+
+#### Analiza
+
+* Sa grafika se može uočiti da se temperature kroz godine za svaki mesec povećavaju
+* Takođe se primećuje da je to povećanje značajnije u zimskim mesecima
+
+### Dekompozicija vremenske serije
+
+```{r global ts decomposition, warning=FALSE}
+ts_global <- ts(na.mean(df_global, option = "mean"), start=c(1750, 1), frequency = 12)    
+
+ts_global <- ts_global[,2]
+decomp_global_avg <- decompose(ts_global[])
+
+autoplot(decomp_global_avg)
+```
+
+
+#### Analiza
+
+* Globalni trend je pozitivan, zaključujemo da temperature rastu
+* Amplituda sezonske komponente iznosi 12 stepena celzijusa
+
+
+### Gradovi
+```{r coastal and continental cities}
+coastal_cities = c("Sydney", "Dublin", "Dubai", "Lisbon")
+continental_cities = c("Ulaanbaatar", "Nuremberg", "Kabul", "Belgrade")
+
+df_city %>% 
+    filter(City %in% c(coastal_cities, continental_cities)) %>%
+    filter(avgTU <.5) %>% 
+    mutate(tip=as.factor(ifelse(City %in% coastal_cities, "priobalni", "kontinentalni"))) %>% 
+    #mutate(time=as.factor(ifelse(dt < as.Date("2000-01-01"), "Pre 2000.", "Posle 2000."))) %>% 
+    ggplot(aes(avgT,label=paste(City,""), fill=tip, color=tip, group=tip))+ geom_density() +
+    facet_wrap(tip~City, nrow = 2, dir = "h")+
+    theme_minimal() + 
+    theme(
+        axis.text.y = element_blank(),axis.ticks.y = element_blank(),
+        axis.line.y = element_blank(),strip.background = element_blank(),
+        strip.text.y = element_blank(),axis.line.x = element_blank(),
+         plot.background = element_rect(fill = "#EFF2F4"),
+        plot.title = element_text(size = 14, face = "bold", colour = "gray20", vjust = -1))
+```
+#### Analiza
+
+* Priobalni gradovi generalno imaju dosta uži raspon temperatura
+* Svi kontinentalni gradovi imaju distribuciju koja je nagnuta u desno
+* Svi priobalni gradovi imaju distrbuciju koja podseca na slovo `M`
+
+### Korelaciona matrica za gradove
+
+```{r corrplot of cities dataframe}
+df <- df_city %>% 
+    filter(dt >= as.Date("1970-01-01")) %>%
+    mutate(dt = as.numeric(as.POSIXct(dt)), 
+           month = as.numeric(month),
+           year = as.numeric(year)) %>% na.omit() %>% 
+    select(dt, month, year, Lat, Lng, avgT)
+
+corrplot(cor(df), type = "upper", method = "number")
+```
+
+Postoji pozitivna korelacija između geografske širine i izmerene temperature.
+
+## Kontinentalna
+
+### Evropa kroz sezone
+
+```{r Europe during seasons, warning=FALSE}
+data_eu <- df_country %>% filter(Country=="Europe") %>% filter(!is.na(avgT))
+data_eu$month <- as.integer(data_eu$month)
+data_eu <- data_eu %>%
+    mutate(season=ifelse(
+        month<6,"Prolece",ifelse(month<9,"Leto",ifelse(month<12,"Jesen","Zima")))) %>% 
+    mutate(before=as.factor(ifelse(dt  >= as.Date("1990-01-01"), TRUE, FALSE)))
+           
+levels(data_eu$before) <- c("Pre 1990. godine", "Posle 1990. godine")
+
+
+ggplot(data_eu,aes(x=avgT))+
+    geom_density(aes(group=season,colour=season,fill=season),alpha=0.2)+
+    scale_y_continuous(name =  "Gustina")+
+    scale_x_continuous(name = "Temperatura", breaks = seq(-10, 24, 2))+
+    theme(panel.background=element_blank())+
+    theme(axis.line = element_line(color = "orange",size=1))+
+    theme(legend.position = "bottom",
+         axis.text = element_text(size = 8,face = "bold"),
+        plot.title = element_text(size=12,face = "bold")) +
+    stat_central_tendency(aes(color = season), type = "median", linetype = 1)+
+    stat_central_tendency(aes(color = season), type = "mean", linetype = 2) +
+    facet_wrap(~before, nrow = 2)
+
+```
+
+#### Analiza
+
+* Primetno je da period posle 1990. godine karakterise porast temperature u
+svim godišnjim dobima podjednako
+* Cela distribucija se pomerila za približno jedan stepen više
+
+
+### Temperature po kontinentima
+
+```{r violin of continents, warning=FALSE}
+continents <- c("Europe",  "Asia" , "North America", "South America", "Australia", "Africa")
+continents_v<-df_country %>% filter(Country %in% continents)%>%filter(!is.na(avgT))  
+
+ggplot(continents_v, aes(x=Country,y=avgT,fill=Country, colour=Country))+
+    geom_violin()+
+    theme(axis.line = element_line(color = "orange",size=1.25))+
+    theme(
+        legend.position = "none",
+        axis.title = element_blank(),
+        axis.text = element_text(size = 10,angle = 20),
+        plot.title = element_text(size=12,face = "bold")
+    ) + 
+    ggtitle("Prosečna temperatura po kontinentima") 
+```
+
+#### Analiza
+
+* Afriku i Južnu Ameriku karakteriše mala raširenost distribucije, jer su to
+kontinenti čija je površina značajnim delom presečena ekvatorom
+* Ostali kontinenti imaju znatno širu distribuciju prosečnih temperatura
+* Australija dostiže najveće vrednosti zato što je većinom pustinjski kontinent
+* Najniže vrednosti dostiže Severna Amerika zbog svoje geografske širine
+
+### Mesečne temperature po kontinentima
+```{r month temps through the years by continent, warning=FALSE}
+cont_mty <- df_country %>% 
+    filter(!is.na(avgT)) %>% 
+    group_by(month) %>% 
+    filter(avgTU < .5) %>% 
+    filter(Country %in% continents)
+
+ggplot(cont_mty,aes(month,avgT,color=as.numeric(year))) + 
+    geom_jitter(size=.5) +
+    scale_color_viridis(option="C")+
+    theme(axis.line = element_line(color = "orange",size=.75))+
+    theme_dark()+
+    scale_x_discrete()+labs(color="year") +
+    theme(legend.position = "bottom",
+        axis.text = element_text(size = 10,face="bold"),
+        plot.title = element_text(size=17,face = "bold")) +
+    facet_wrap(~ Country)
+```
+
+#### Analiza 
+
+* Evropa, Azija i Severna Amerika imaju raspodelu temperatura po mesecima u obliku
+zvona. To se tumači time što su sva tri kontinenta na severnoj polulopti.
+* Afrika ima raspodelu u obliku slova ` M ` zato što se ona nalazi svojim delovima
+i na severnoj i na južnoj polulopti
+* Australija i Južna Amerika imaju suprotnu raspodelu od kontinenata koji su na 
+severnoj polulopti
+
+## Srbija
+
+
+### Raspodela mesečnih temperatura kroz godine
+
+```{r comparing the distributions of temps through years, warning=FALSE}
+countries <- c("Serbia","Australia")
+vals <- df_country %>% 
+    filter(Country %in% countries) %>% 
+    group_by(year,Country) %>% 
+    mutate(no=length(year)) %>% 
+    filter(no==12) %>%
+    arrange(month)
+
+ggplot(vals,aes(month,avgT, group=year,color =as.numeric(year))) + geom_line(alpha= 0.4) +
+  theme(axis.line = element_line(color = "orange",size=1))+
+      theme(panel.background=element_blank())+ scale_color_viridis(option="D")+
+      scale_x_discrete()+labs(color="year") +
+   facet_wrap(~Country)+
+    xlab("Month")+ylab("Average Temperature")+
+  theme(legend.position = "bottom",
+                     axis.text = element_text(size = 10,face="bold"),
+        plot.title = element_text(size=16,face = "bold")) + 
+  ggtitle("Prosecne temperature po mesecima kroz godine") 
+```
+
+#### Analiza
+* Srbija u odnosu na Australiju ima veliki raspon temperatura, što se može
+pripisati kontinentalnoj klimi
+* Srbija se nalazi iznad ekvatora, tj. na severnoj polulopti što uzrokuje visoke
+temperature leti i niske zimi
+* Srbija ,kao i Australija, prati trend globalnog porasta temperature
+
+
+### Srbija po sezonama
+```{r Serbia during seasons, warning=FALSE}
+data_srb <- df_country %>% filter(Country=="Serbia") %>% filter(!is.na(avgT)) %>% filter(avgTU < 1)
+data_srb$month <- as.integer(data_srb$month)
+data_srb <- data_srb %>%
+    mutate(
+        season=
+            ifelse(month<6,"Prolece",
+            ifelse(month<9,"Leto",
+            ifelse(month<12,"Jesen","Zima")))) %>% 
+    mutate(before=as.factor(ifelse(dt  >= as.Date("2000-01-01"), TRUE, FALSE)))
+           
+levels(data_srb$before) <- c("Pre 2000. godine", "Posle 2000. godine")
+
+ggplot(data_srb,aes(x=avgT))+
+    geom_density(aes(group=season,colour=season,fill=season),alpha=0.2)+
+    scale_y_continuous(name =  "Gustina")+
+    scale_x_continuous(name =  "Temperatura", breaks = seq(-10, 28, 2))+
+    theme(panel.background=element_blank())+
+    theme(axis.line = element_line(color = "orange",size=1))+
+    stat_central_tendency(aes(color = season), type = "median", linetype = 1)+
+    stat_central_tendency(aes(color = season), type = "mean", linetype = 2) +
+    theme(legend.position = "bottom",
+         axis.text = element_text(size = 8,face = "bold"),
+        plot.title = element_text(size=12,face = "bold")) + 
+    facet_wrap(~before, nrow = 2)
+
+```
+
+#### Analiza
+
+* Leta su postala toplija u poslednjih 20 godina za malo manje od 2 stepena celzijusa
+kao i zime, za malo manje od 1 stepen celzijusa
+
+### Beograd
+
+### Dekompozicija vremeske serije
+```{r serbian ts decomposition, warning=FALSE}
+ts_srb <- ts(na.mean(df_country %>% filter(Country == "Serbia"), option = "mean"), start=c(1743, 11), frequency = 12)    
+
+ts_srb <- ts_srb[,2]
+decomp_srb<- decompose(ts_srb[])
+
+autoplot(decomp_srb)
+```
+
+
+#### Analiza
+
+* Srbija prati globalni trend povećanja temperature
+* Amplituda vremenske komponente iznosi 20 stepena celzijusa, karakteristično
+za kontinentalne zemlje
+
+# Modelovanje
+
+## Formulacija trening i test skupa
+```{r generate train and test dataset, warning=FALSE}
+library(TSstudio)
+ts_global_for_modeling <- ts(na.mean(df_global %>% filter(dt >= as.Date("2000-01-01")), option = "mean"), start=c(2000, 1), frequency = 12)
+ts_global_for_modeling <- ts_global_for_modeling[,2]
+split_ts_global <- ts_split(ts_global_for_modeling, sample.out = 24)
+training <- split_ts_global$train
+testing <- split_ts_global$test
+```
+
+
+
+## Multivarijabilni generalizovani aditivni model
+
+U ovom koraku je načinjen pokušaj da se srednja mesečna temperatura modeluje preko
+geografske širine, geografske dužine i meseca u godini. Iako su male šanse da će ovakav model biti 
+adekvatan, nije na odmet pokušati.
+```{r multivariate lin reg}
+library(mgcv)
+df <- df_city %>% 
+    filter(dt >= as.Date("1970-01-01")) %>%
+    mutate(year = as.numeric(year)) %>% 
+    mutate(month = as.numeric(month)) %>% 
+    group_by(Lat, Lng, month) %>% summarise(t = mean(avgT)) %>% 
+    select(t, Lat, Lng, month)
+    
+gam_model <- gam(t ~ s(Lat) + s(Lng) + s(month),
+                 data = df)
+summary(gam_model)
+```
+Ovakav model teško da će adekvatno moći da opiše svu varijansu. Ukupno odstupanje koje je objašnjeno jeste 72% što nije zadovoljavajući rezultat.
+
+
+## SARIMA
+```{r SARIMA, warning=FALSE, logi=FALSE}
+library(forecast)
+library(tseries)
+
+adf.test(training, k=12)
+fcModel <- auto.arima(training, seasonal = T, trace = T) 
+summary(fcModel)
+
+res <- predict(fcModel, n.ahead = 24)
+#RMSE na testnom
+sqrt(sum((as.data.frame(res$pred) - as.data.frame(testing))^2)) / 24
+autoplot(forecast(fcModel, h = 24)) + xlim(as.Date("2010-01-01"),as.Date("2016-01-01"))
+```
+
+Primećujemo da naš model dovoljno dobro predvidja temperaturu u narednih 2 godine.
+
+```{r residual check}
+residuals <- checkresiduals(fcModel)
+```
+Reziduali nam govore koliko je dobar naš model. Ukoliko su reziduali nisu korelisani i ukoliko im je srednja vrednost
+bliska 0 onda kazemo da je model dobar. Takodje je poželjno da im je raspodela normalna i da im je varijansa konstantna. Kao što se sa grafika primećuje, ne postoji autokorelacija i raspodela je normalna.
+
+## Holt-Wintersovo eksponencijalno glačanje
+
+Vremenske serije se mogu takođe modelovati korišćenjem Holt-Wintersovog eksponencijalnog glačanja.
+
+
+```{r Holt-Winters exponential smoothing}
+temp_timeseries_forcast <- HoltWinters(training)
+temp_timeseries_forcast
+plot(temp_timeseries_forcast)
+forecasted <- forecast(temp_timeseries_forcast, h= 24)
+autoplot(forecasted) + xlim(as.Date("2010-01-01"),as.Date("2016-01-01"))
+```
+
+Holt-Winters model daje slične rezultate kao SARIMA.
+
+```{=latex}
+\newpage
+```
+# Zaključak
+
+
+* Postoji pozitivan trend porasta prosečne globalne temperature
+
+* Postoji jaka veza izmedju emisija ugljen dioksida i porasta globalne temperature
+
+* Postoji pozitivna korelacija izmedju geografske sirine i izmerene temperature
+
+* Kontinentalni i priobalni gradovi imaju drugačiju distribuciju temperature u godini
+
+* Srbija prati globalni trend porasta globalne temperature i nalazi se na 15. mestu
+po povećanju globalne temperature od 1796. sa porastom nešto manje od 3 stepena
+```{=latex}
+\newpage
+```
+
+# Literatura
+
+* Uvod u programski jezik R, Miloš Ivanović, Tatjana Bošković
+
+* https://medium.com/@kfoofw/seasonal-lags-sarima-model-fa671a858729
+
+* https://r4ds.had.co.nz/exploratory-data-analysis.html
+
+* https://a-little-book-of-r-for-time-series.readthedocs.io/en/latest/src/timeseries.html
+
+* http://environmentalcomputing.net/intro-to-gams/
+
+* https://blog.minitab.com/en/adventures-in-statistics-2/regression-analysis-how-do-i-interpret-r-squared-and-assess-the-goodness-of-fit
