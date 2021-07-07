@@ -237,8 +237,9 @@ xts_emission <- as.xts(ts(df_emission, start=1751, frequency = 1, deltat = 1))
 ```{r df_city chr lat lng to numeric}
 library(stringr)
 str2dec <- function(str){
-    last_char <- str[nchar(str)-1]
-    if(last_char %in% c('N','W'))
+    last_char <- substr(str, nchar(str), nchar(str))
+    print(last_char)
+    if(last_char %in% c("N","W"))
     {
         return (as.numeric(str_sub(str, end=nchar(str)-1)))
     }
@@ -249,6 +250,8 @@ str2dec <- function(str){
 }
 df_city$Lng <- df_city$Lng  %>% str2dec()
 df_city$Lat <- df_city$Lat  %>% str2dec()
+df_city$year <- as.numeric(df_city$year)
+df_city$month <- as.numeric(df_city$month)
 head(df_city[c("Lat","Lng")])
 ```
 ## Pronalaženje i rešavanje nepostojećih vrednosti
